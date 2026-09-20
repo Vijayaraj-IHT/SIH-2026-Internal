@@ -1,0 +1,74 @@
+name: CI
+
+# What can be checked without the audio corpora (which are hundreds of megabytes
+# and cannot be redistributed) is checked here: the audio codecs against the ITU
+# reference, the feature front-end against the C implementation that runs on the
+# device, the window placement geometry, the streaming policy and the served API.
+#
+# Tests that need the cache or a trained run skip themselves via the markers in
+# tests/conftest.py, so this workflow is green on a fresh clone and becomes
+# stricter as data is added.
+
+on:
+  push:
+    branches: [main, "arena/**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # CPU-only TensorFlow keeps the image small; the project has no GPU path.
+          pip install -r requirements-ml.txt
+          pip install -r requirements-server.txt
+          pip install -r requirements-dev.txt
+
+      - name: Test suite
+        run: python -m pytest tests -q
+
+      - name: C front-end parity (host simulator)
+        run: |
+          # Needs the generated tables header; without a trained run this uses the
+          # default front-end parameters, which is exactly what CI should verify.
+          if [ -f edge/common/kws_frontend_tables.h ]; then
+            make -C edge/host_sim && ./edge/host_sim/kws_host_sim --g711
+          else
+            echo "kws_frontend_tables.h not generated; skipping host build"
+          fi
+
+      - name: Import smoke test (every module must at least import)
+        run: |
+          python - <<'PY'
+          import importlib
+          for mod in [
+              "ml.common.audio", "ml.common.features", "ml.common.streaming", "ml.common.synth",
+              "ml.data.pipeline", "ml.models.dscnn",
+              "ml.tools.train", "ml.tools.evaluate", "ml.tools.export_tflite", "ml.tools.streaming_eval",
+              "server.app", "server.asr", "server.runtime", "server.store",
+          ]:
+              importlib.import_module(mod)
+              print("ok", mod)
+          PY
+
+      - name: Server smoke test
+        run: |
+          python - <<'PY'
+          from fastapi.testclient import TestClient
+          from server.app import app
+          client = TestClient(app)
+          assert client.get("/v1/health").status_code == 200
+          assert client.get("/v1/model").status_code == 200
+          print("server health ok")
+          PY
