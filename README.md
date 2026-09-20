@@ -23,7 +23,10 @@ accuracy number**:
 | Area | State |
 |---|---|
 | Data pipeline, placement geometry, cache builder | fixed and tested |
-| Model, training loop, export, streaming, server, edge C, firmware sources | written, unit-tested, not yet exercised end to end |
+| C front-end + G.711 | compiled, and parity-checked against Python: **1960/1960 int8 feature values identical** (`make frontend-check`) |
+| µ-law uplink codec | bit-exact against the ITU reference vectors |
+| Model, training loop, export, streaming, server | written, unit-tested, not yet exercised end to end |
+| ESP32 firmware itself | sources only — no ESP-IDF toolchain on this machine, so it has never been built |
 | Trained model with a quotable test score | **pending** — see `artifacts/README.md` |
 
 The three data bugs that blocked training (displaced keyword spans, class-ordered
@@ -41,7 +44,7 @@ runs in `artifacts/` were produced; those runs are kept only as diagnostics.
 | `ml/tools/export_tflite.py` | full-integer int8 export + the C array the firmware compiles |
 | `ml/tools/streaming_eval.py` | streaming benchmark: latency, false activations per hour, SNR sweep |
 | `ml/common/streaming.py` | the sliding-window detector, decision policy and online/offline scoring |
-| `edge/common/` | portable C99 log-mel front-end and G.711 µ-law codec (no allocation, no OS) |
+| `edge/common/` | portable C99 log-mel front-end and G.711 µ-law codec (no allocation, no OS); parity with the Python front-end is checked by `tests/test_frontend_parity.py` |
 | `edge/host_sim/` | host harness: front-end parity dump, timing bench, µ-law check |
 | `edge/esp32/` | ESP-IDF firmware: I2S capture, inference, wake uplink |
 | `server/` | FastAPI service: wake events, µ-law ASR endpoint, websocket streaming, dashboard |
@@ -55,7 +58,8 @@ make data             # download the corpora (~1 GB, once)
 make cache            # build the TFRecord cache
 make train            # train the wake-word model          -> artifacts/<run>/
 make export           # int8 export + tensor-arena estimate
-make frontend         # generate the C tables the firmware needs
+make frontend         # generate the C tables the firmware needs (after export)
+make frontend-check   # build the C front-end + check it against Python (no trained run needed)
 make test             # run the test suite
 make serve            # dashboard + ASR endpoints at http://localhost:8000
 ```

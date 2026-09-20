@@ -28,7 +28,7 @@ DATA_DIR ?= data/datasets
 HOST ?= 127.0.0.1
 PORT ?= 8000
 
-.PHONY: help install data cache train export frontend host test bench evaluate esp32 serve all clean clean-runs
+.PHONY: help install data cache train export frontend host frontend-check test bench evaluate esp32 serve all clean clean-runs
 
 help:
 	@grep -E '^#   make' -m 40 Makefile | sed 's/^#   //'
@@ -76,6 +76,15 @@ test:
 
 host:
 	$(MAKE) -C edge/host_sim
+
+# The window and mel filterbank tables are pure functions of the front-end
+# parameters, so the C front-end can be built and checked against the Python
+# implementation without a trained model. This is the fast way to catch a
+# front-end regression; `make frontend` is the calibrated, deployable path.
+frontend-check:
+	$(PY) -m edge.tools.export_frontend_header --allow-default-quant
+	$(MAKE) -C edge/host_sim
+	$(PY) -m pytest tests/test_frontend_parity.py -q
 
 bench: export
 	$(PY) -m ml.tools.streaming_eval --run-name "$(RUN)"
