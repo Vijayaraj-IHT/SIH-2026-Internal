@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""Quantise the trained model to int8 and export exactly what the device needs.
+
+    python -m ml.tools.export_tflite --run-name hb-dscnn-w100
+
+Produces, under ``artifacts/<run>/``:
+
+    model_int8.tflite     fully-integer quantised model (no float fallback ops)
+    model_int8.tflite.h   the same bytes as a C array for ESP-IDF
+    frontend_int8.json    mel matrix / window / quantisation constants for the
+                          fixed-point front-end (consumed by the server and by
+                          ``edge/tools/export_frontend_header.py``)
+    export_report.json    sizes, op inventory, MACs, and the measured
+                          float->int8 accuracy delta
+
+Why full integer and not dynamic-range quantisation
+---------------------------------------------------
+The device budget is "<256 KB RAM, <10% CPU while idle listening".  Dynamic
+range quantisation keeps activations in float32 - that alone costs 4x the
+activation memory and forces float fallbacks on device.  Full int8 (weights +
+activations) is what makes the RAM figure achievable, and it is the only variant
+TFLite Micro runs without a float kernel.  Every op in this model has an int8
+kernel (conv2d, depthwise_conv2d, add, mul, mean, logistic), so no fallback is
+needed - which this script asserts rather than assumes.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+import tensorflow as tf
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from ml.common.features import FrontendParams, calibrate_quant_params  # noqa: E402
+from ml.data.pipeline import AugmentConfig, TFFrontend, build_dataset, load_noise_bank  # noqa: E402
+
+# Operations that TFLite Micro can run in pure int8.  Anything else appearing in
+# the converted graph would silently pull in a float kernel (or fail at runtime).
+INT8_SAFE_OPS = {
+    "CONV_2D",
+    "DEPTHWISE_CONV_2D",
+    "FULLY_CONNECTED",
+    "MEAN",
+    "MUL",
+    "ADD",
+    "SUB",
+    "LOGISTIC",
+    "RELU",
+    "RELU6",
+    "MAX_POOL_2D",
+    "AVERAGE_POOL_2D",
+    "PAD",
+    "RESHAPE",
+    "SOFTMAX",
+    "TRANSPOSE",
+    "CONCATENATION",
+    "QUANTIZE",
+    "DEQUANTIZE",
+    "LOG",
+    "RSQRT",
+}
+
+
+def estimate_macs(model: tf.keras.Model) -> int:
+    """Analytic multiply-accumulate count for the deployed head (int8 == same MACs)."""
+    from tensorflow.keras import layers as L
+
+    macs = 0
+    for layer in model.layers:
+        cfg = layer.get_config()
+        if isinstance(layer, L.Conv2D):
+            kh, kw = cfg["kernel_size"]
+            _, _, c_in = layer.input.shape[1:] if layer.input.shape.rank == 4 else (None, None, None, None)
+            c_out = cfg["filters"]
+            out_h, out_w = layer.output.shape[1], layer.output.shape[2]
+            macs += int(kh * kw * c_in * c_out * out_h * out_w)
+        elif isinstance(layer, L.DepthwiseConv2D):
+            kh, kw = cfg["kernel_size"]
+            out_h, out_w, c_out = layer.output.shape[1], layer.output.shape[2], layer.output.shape[3]
+            macs += int(kh * kw * c_out * out_h * out_w)
+        elif isinstance(layer, L.Dense):
+            in_features = int(np.prod(layer.input.shape[1:]))
+            macs += int(in_features * cfg["units"])
+    return macs
+
+
+def representative_dataset(cache_dir: Path, params: FrontendParams, n_batches: int = 24, batch: int = 128):
+    """Yield realistic float32 feature windows for the quantiser's calibration.
+
+    These come from the real validation split (with the same augmentation the
+    model saw in training) rather than from random noise, which matters: the
+    activation ranges of a keyword spotter depend heavily on the noise floor of
+    the audio it will actually see.
+    """
+    index = json.loads((cache_dir / "cache_index.json").read_text())
+    files = index["splits"]["val"]["files"]
+    frontend = TFFrontend(params)
+    aug = AugmentConfig()
+    noise_bank = load_noise_bank(cache_dir, max_clips=32)
+    limit = n_batches * batch
+    ds = build_dataset(files, frontend, aug, batch, noise_bank, seed=99, train=False, drop_remainder=False)
+    produced = 0
+    for feats, _targets in ds:
+        for i in range(feats.shape[0]):
+            yield [feats[i : i + 1].numpy()[..., np.newaxis]]
+            produced += 1
+            if produced >= limit:
+                return
+
+
+def run_int8(interpreter: tf.lite.Interpreter, features_int8: np.ndarray) -> float:
+    """Run one window through the int8 interpreter and return the wake probability."""
+    inp = interpreter.get_input_details()[0]
+    out = interpreter.get_output_details()[0]
+    interpreter.set_tensor(inp["index"], features_int8.reshape(inp["shape"]))
+    interpreter.invoke()
+    raw = interpreter.get_tensor(out["index"]).ravel()[0]
+    scale, zero = out["quantization"]
+    return float((raw - zero) * scale) if scale else float(raw)
+
+
+def to_c_array(data: bytes, name: str, per_line: int = 12) -> str:
+    lines = [
+        "// Auto-generated by ml/tools/export_tflite.py - do not edit by hand.",
+        "#pragma once",
+        "#include <stddef.h>",
+        "#include <stdint.h>",
+        "",
+        f"const unsigned char {name}[] = {{",
+    ]
+    for i in range(0, len(data), per_line):
+        chunk = ", ".join(f"0x{b:02x}" for b in data[i : i + per_line])
+        lines.append(f"  {chunk},")
+    lines += ["};", f"const unsigned int {name}_len = {len(data)};", ""]
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--run-name", default="hb-dscnn-w100")
+    ap.add_argument("--artifacts-root", type=Path, default=Path("artifacts"))
+    ap.add_argument("--cache-dir", type=Path, default=Path("data/cache"))
+    ap.add_argument("--calib-batches", type=int, default=16)
+    ap.add_argument("--eval-windows", type=int, default=512, help="windows used for the float->int8 delta")
+    ap.add_argument("--representative-per-batch", type=int, default=32)
+    args = ap.parse_args(argv)
+
+    run_dir = args.artifacts_root / args.run_name
+    if not run_dir.exists():
+        print(f"ERROR: {run_dir} does not exist - train first", file=sys.stderr)
+        return 2
+
+    model_path = run_dir / "window_head.keras"
+    if not model_path.exists():
+        print(f"ERROR: {model_path} missing", file=sys.stderr)
+        return 2
+
+    params = FrontendParams.from_dict(json.loads((run_dir / "frontend.json").read_text()))
+    model = tf.keras.models.load_model(model_path)
+    print(f"[export] loaded {model_path} ({model.count_params():,} params)")
+
+    # ---- calibrate the feature quantiser from real windows ----------------
+    index = json.loads((args.cache_dir / "cache_index.json").read_text())
+    frontend = TFFrontend(params)
+    aug = AugmentConfig()
+    noise_bank = load_noise_bank(args.cache_dir, max_clips=32)
+    calib_ds = build_dataset(
+        index["splits"]["val"]["files"], frontend, aug, 128, noise_bank, seed=5, train=False, drop_remainder=False
+    )
+    sample = []
+    for feats, _ in calib_ds:
+        sample.append(feats.numpy())
+        if sum(s.shape[0] for s in sample) >= 4096:
+            break
+    sample_np = np.concatenate(sample)[:4096]
+    params.quant = calibrate_quant_params(sample_np)
+    print(f"[export] feature quantisation: scale={params.quant.scale:.6f} zero_point={params.quant.zero_point}")
+
+    # ---- convert ----------------------------------------------------------
+    def rep_gen():
+        produced = 0
+        cap = args.calib_batches * args.representative_per_batch
+        for feats, _targets in calib_ds:
+            for i in range(feats.shape[0]):
+                yield [feats[i : i + 1].numpy()[..., np.newaxis]]
+                produced += 1
+                if produced >= cap:
+                    return
+
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    converter.representative_dataset = rep_gen
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+    converter.inference_input_type = tf.int8
+    converter.inference_output_type = tf.int8
+    tflite_bytes = converter.convert()
+    tflite_path = run_dir / "model_int8.tflite"
+    tflite_path.write_bytes(tflite_bytes)
+    print(f"[export] wrote {tflite_path} ({len(tflite_bytes):,} bytes / {len(tflite_bytes)/1024:.1f} KiB)")
+
+    (run_dir / "model_int8.tflite.h").write_text(to_c_array(tflite_bytes, "kws_model_int8_tflite"))
+    print(f"[export] wrote {run_dir / 'model_int8.tflite.h'}")
+
+    # ---- verify the graph is genuinely integer-only ----------------------
+    interpreter = tf.lite.Interpreter(model_content=tflite_bytes)
+    interpreter.allocate_tensors()
+    ops = interpreter._get_ops_details()  # noqa: SLF001 - only public-ish way to inventory ops
+    op_names = sorted({op["op_name"] for op in ops})
+    unexpected = [op for op in op_names if op not in INT8_SAFE_OPS]
+    inp = interpreter.get_input_details()[0]
+    out = interpreter.get_output_details()[0]
+    float_tensors = []
+    for det in interpreter.get_tensor_details():
+        if det["dtype"] == np.float32:
+            float_tensors.append(det["name"])
+
+    # ---- float -> int8 accuracy delta ------------------------------------
+    frontend_np = params
+    eval_ds = build_dataset(
+        index["splits"]["val"]["files"], frontend, aug, args.eval_windows, noise_bank, seed=11,
+        train=False, drop_remainder=False,
+    )
+    feats_batch, targets_batch = next(iter(eval_ds))
+    feats_np = feats_batch.numpy()
+    wake_true = np.asarray(targets_batch["wake"]).ravel()
+    float_scores = model.predict(feats_np[..., np.newaxis], verbose=0).ravel()
+    int8_scores = np.array(
+        [run_int8(interpreter, params.quant.quantize(f)) for f in feats_np]
+    )
+
+    from ml.tools.train import precision_recall_auc, roc_auc
+
+    report = {
+        "run_name": args.run_name,
+        "model_params": int(model.count_params()),
+        "tflite_bytes": len(tflite_bytes),
+        "tflite_kib": len(tflite_bytes) / 1024.0,
+        "relu6_hint": True,
+        "ops": op_names,
+        "op_count": len(ops),
+        "unexpected_ops": unexpected,
+        "integer_only": len(float_tensors) == 0,
+        "float_tensors": float_tensors[:10],
+        "input_detail": {
+            "shape": list(inp["shape"]),
+            "dtype": str(inp["dtype"]),
+            "quantization": [float(x) for x in inp["quantization"]],
+        },
+        "output_detail": {
+            "shape": list(out["shape"]),
+            "dtype": str(out["dtype"]),
+            "quantization": [float(x) for x in out["quantization"]],
+        },
+        "feature_quantisation": params.quant.to_dict(),
+        "macs_per_window": estimate_macs(model),
+        "eval_windows": int(feats_np.shape[0]),
+        "float_auc": roc_auc(wake_true, float_scores),
+        "int8_auc": roc_auc(wake_true, int8_scores),
+        "float_ap": precision_recall_auc(wake_true, float_scores),
+        "int8_ap": precision_recall_auc(wake_true, int8_scores),
+        "mean_abs_score_delta": float(np.mean(np.abs(float_scores - int8_scores))),
+        "max_abs_score_delta": float(np.max(np.abs(float_scores - int8_scores))),
+    }
+    report["auc_delta"] = report["int8_auc"] - report["float_auc"]
+    report["ap_delta"] = report["int8_ap"] - report["float_ap"]
+
+    (run_dir / "export_report.json").write_text(json.dumps(report, indent=2))
+    (run_dir / "frontend_int8.json").write_text(
+        json.dumps({**params.to_dict(), "quant": params.quant.to_dict(), "mel_matrix": params.mel_matrix.tolist()}, indent=2)
+    )
+
+    print(json.dumps({k: v for k, v in report.items() if k != "ops"}, indent=2))
+    print(f"\n[export] ops: {', '.join(op_names)}")
+    if unexpected:
+        print(f"[export] WARNING: ops without a pure-int8 kernel: {unexpected}", file=sys.stderr)
+        return 1
+    if not report["integer_only"]:
+        print(f"[export] WARNING: graph still contains float tensors: {float_tensors[:5]}", file=sys.stderr)
+        return 1
+    print("[export] OK: integer-only graph, no float fallback ops")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
