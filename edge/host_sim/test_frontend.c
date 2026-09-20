@@ -14,6 +14,13 @@
  *     ./kws_host_sim --bench in.pcm [seconds]
  *     ./kws_host_sim --g711  in.pcm out.ulaw
  */
+/* The timing code below uses clock_gettime(CLOCK_MONOTONIC), which POSIX exposes
+ * only when _POSIX_C_SOURCE is declared; with plain -std=c99 the compiler stops at
+ * "implicit declaration of function 'clock_gettime'". This is host-only code, so
+ * asking for the POSIX namespace is the right fix - the firmware does its timing
+ * with esp_timer instead. */
+#define _POSIX_C_SOURCE 199309L
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>

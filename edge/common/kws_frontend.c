@@ -80,7 +80,7 @@ void kws_frontend_init(kws_frontend_t *fe, kws_quant_t quant)
     }
 }
 
-void kws_frontend_frame(const kws_frontend_t *fe, const int16_t *frame, int8_t out[KWS_NUM_MEL_BINS])
+void kws_frontend_frame(kws_frontend_t *fe, const int16_t *frame, int8_t out[KWS_NUM_MEL_BINS])
 {
     /* 1. windowed frame -> float, zero-padded to the FFT size */
     for (int i = 0; i < KWS_FRAME_LENGTH; ++i) {
@@ -95,7 +95,7 @@ void kws_frontend_frame(const kws_frontend_t *fe, const int16_t *frame, int8_t o
     fft_radix2(fe->fft_re, fe->fft_im, fe->bit_reverse, KWS_FFT_SIZE);
 
     /* 3. power spectrum (only the first n/2+1 bins are used by the filterbank) */
-    float power[KWS_FFT_SIZE / 2 + 1];
+    float *power = fe->fft_power;
     for (int i = 0; i <= KWS_FFT_SIZE / 2; ++i) {
         power[i] = fe->fft_re[i] * fe->fft_re[i] + fe->fft_im[i] * fe->fft_im[i];
     }
@@ -119,28 +119,40 @@ void kws_frontend_frame(const kws_frontend_t *fe, const int16_t *frame, int8_t o
 
 bool kws_frontend_push(kws_frontend_t *fe, const int16_t *samples, size_t n)
 {
+    /* Samples are appended to `sample_ring`, which always holds the samples of the
+     * frame being assembled, contiguously:
+     *
+     *   first frame : [0 .. FRAME_LENGTH)                    <- 480 new samples
+     *   afterwards  : [0 .. KEEP) tail of the previous frame <- carried over
+     *                 [KEEP .. FRAME_LENGTH) new samples      <- HOP new samples
+     *
+     * KEEP = FRAME_LENGTH - HOP = 160, so the frames start at 0, HOP, 2*HOP, ...
+     * exactly like `frame_signal()` on the Python side.  An earlier version
+     * prefilled the ring with KEEP zeros, which put every device frame 160 samples
+     * (10 ms) behind the training frames - a shift that is invisible in the feature
+     * values and quietly misaligns the keyword.
+     */
+    const size_t keep = KWS_FRAME_LENGTH - KWS_FRAME_HOP;
     bool produced = false;
+
     for (size_t i = 0; i < n; ++i) {
-        /* keep the newest (frame_length - hop) samples plus this one */
-        const size_t keep = KWS_FRAME_LENGTH - KWS_FRAME_HOP;
-        if (fe->samples_since_frame >= KWS_FRAME_HOP) {
-            memmove(fe->sample_ring, fe->sample_ring + KWS_FRAME_HOP, (keep) * sizeof(int16_t));
-            fe->samples_since_frame -= KWS_FRAME_HOP;
-        }
-        fe->sample_ring[KWS_FRAME_LENGTH - KWS_FRAME_HOP + fe->samples_since_frame] = samples[i];
+        const bool first_frame = (fe->frames_emitted == 0);
+        const size_t base = first_frame ? 0 : keep;
+        const size_t needed = first_frame ? KWS_FRAME_LENGTH : KWS_FRAME_HOP;
+
+        fe->sample_ring[base + fe->samples_since_frame] = samples[i];
         fe->samples_since_frame++;
 
-        if (fe->samples_since_frame == KWS_FRAME_HOP) {
-            /* we now hold exactly KWS_FRAME_LENGTH contiguous samples:
-             * [0 .. keep) are the carried-over tail, [keep .. hop+keep) are new */
-            int16_t frame[KWS_FRAME_LENGTH];
-            memcpy(frame, fe->sample_ring, keep * sizeof(int16_t));
-            memcpy(frame + keep, fe->sample_ring + keep, KWS_FRAME_HOP * sizeof(int16_t));
-
-            /* shift the rolling spectrogram and append the new frame */
+        if (fe->samples_since_frame == needed) {
+            /* shift the rolling spectrogram, then append the frame straight out of
+             * the ring - it is already contiguous, so no staging copy is needed */
             memmove(&fe->frames[0][0], &fe->frames[1][0],
                     (KWS_CONTEXT_FRAMES - 1) * KWS_NUM_MEL_BINS);
-            kws_frontend_frame(fe, frame, fe->frames[KWS_CONTEXT_FRAMES - 1]);
+            kws_frontend_frame(fe, fe->sample_ring, fe->frames[KWS_CONTEXT_FRAMES - 1]);
+
+            /* carry the tail of this frame into the head of the next one */
+            memmove(fe->sample_ring, fe->sample_ring + KWS_FRAME_HOP, keep * sizeof(int16_t));
+
             fe->frames_emitted++;
             if (fe->frames_filled < KWS_CONTEXT_FRAMES) fe->frames_filled++;
             fe->samples_since_frame = 0;
@@ -152,7 +164,18 @@ bool kws_frontend_push(kws_frontend_t *fe, const int16_t *samples, size_t n)
 
 void kws_frontend_window(const kws_frontend_t *fe, int8_t *out)
 {
-    const int8_t floor_q = (int8_t)(KWS_LOG_FLOOR / fe->quant.scale + (float)fe->quant.zero_point + 0.5f);
+    /* The padded rows must be the quantised value of ln(log_floor), not of
+     * log_floor itself.  The Python side pads with `np.log(params.log_floor)`
+     * (= -13.8), and quantising the raw 1e-6 instead gives zero_point, i.e. 70 in
+     * the tables this repository generates - a padding row that is 197 int8 steps
+     * away from the value the model was trained on, fed to the first frames of
+     * every window. */
+    const float floor_log = logf(KWS_LOG_FLOOR);
+    float fq = floor_log / fe->quant.scale + (float)fe->quant.zero_point;
+    fq = (fq >= 0.0f) ? floorf(fq + 0.5f) : ceilf(fq - 0.5f);
+    if (fq > 127.0f) fq = 127.0f;
+    if (fq < -128.0f) fq = -128.0f;
+    const int8_t floor_q = (int8_t)fq;
     const uint32_t filled = fe->frames_filled < KWS_CONTEXT_FRAMES ? fe->frames_filled : KWS_CONTEXT_FRAMES;
     const uint32_t pad = KWS_CONTEXT_FRAMES - filled;
 
@@ -183,6 +206,12 @@ void kws_frontend_waveform_to_features(const int16_t *pcm, size_t n_samples, int
     /* the tables header also carries the quantisation constants chosen at export */
     kws_quant_t q = {KWS_QUANT_SCALE, KWS_QUANT_ZERO_POINT, KWS_LOG_FLOOR};
     kws_frontend_init(&fe, q);
-    kws_frontend_push(&fe, pcm, n_samples);
+    /* Only the first KWS_WINDOW_SAMPLES are consumed: that is exactly the audio
+     * needed for CONTEXT_FRAMES frames, and `ml.common.features.features_from_waveform`
+     * likewise takes the *first* 49 frames of a clip (`_fix_frames` truncates with
+     * `mel[:n]`).  Pushing the whole clip would instead yield the rolling *last* 49
+     * frames, which is the streaming contract and a different window. */
+    const size_t used = (n_samples < (size_t)KWS_WINDOW_SAMPLES) ? n_samples : (size_t)KWS_WINDOW_SAMPLES;
+    kws_frontend_push(&fe, pcm, used);
     kws_frontend_window(&fe, out_features);
 }

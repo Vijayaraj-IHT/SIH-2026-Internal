@@ -30,17 +30,30 @@ from ml.common.features import FrontendParams, hann_periodic, mel_filterbank  # 
 
 
 def c_float_array(name: str, values: np.ndarray, shape: tuple[int, ...], per_line: int = 6, fmt: str = ".8f") -> str:
-    flat = np.asarray(values, dtype=np.float64).ravel()
+    """Emit a C float array.
+
+    A 2-D array is emitted with an explicit brace per row.  Writing it as one flat
+    list is legal C but triggers ``-Wmissing-braces`` in every translation unit that
+    includes the header, and a header that makes the build noisy is a header people
+    stop reading.
+    """
+    arr = np.asarray(values, dtype=np.float64)
+    flat = arr.ravel()
     dims = ", ".join(str(s) for s in shape)
     lines = [f"/* {name}: shape {{{dims}}} */".replace("{{", "{").replace("}}", "}")]
     if len(shape) == 1:
         lines.append(f"static const float {name}[{shape[0]}] = {{")
-    else:
+        for i in range(0, len(flat), per_line):
+            lines.append("    " + ", ".join(f"{v:{fmt}}f" for v in flat[i : i + per_line]) + ",")
+    elif len(shape) == 2:
         lines.append(f"static const float {name}[{shape[0]}][{shape[1]}] = {{")
-    width = shape[-1] if len(shape) > 1 else len(flat)
-    for i in range(0, len(flat), per_line):
-        chunk = ", ".join(f"{v:{fmt}}f" for v in flat[i : i + per_line])
-        lines.append(f"    {chunk},")
+        for row in arr:
+            lines.append("    {")
+            for i in range(0, len(row), per_line):
+                lines.append("        " + ", ".join(f"{v:{fmt}}f" for v in row[i : i + per_line]) + ",")
+            lines.append("    },")
+    else:
+        raise ValueError(f"c_float_array handles 1-D and 2-D arrays, got shape {shape}")
     lines.append("};")
     return "\n".join(lines)
 
@@ -100,6 +113,28 @@ OP_TO_RESOLVER = {
 }
 
 
+#: Quantisation used when no trained run supplies its calibrated constants.
+#:
+#: The window, the mel filterbank and the FIR taps are pure functions of the
+#: front-end parameters - they do **not** depend on training, so a fresh clone can
+#: build and parity-test the C front-end. Only the int8 affine constants come from
+#: the exported model. This pair is a nominal range for log-mel in this front-end
+#: (the floor is ln(1e-6) = -13.8, real speech peaks a few dB above 0), and it must
+#: be replaced by the calibrated values before flashing a device - the firmware
+#: would otherwise dequantise the model's input with the wrong scale. It is fine
+#: for the parity test, which only needs the C and Python sides to agree.
+NOMINAL_FEATURE_RANGE = (-14.0, 4.0)
+
+
+def default_quant_params() -> "QuantParams":
+    from ml.common.features import QuantParams
+
+    lo, hi = NOMINAL_FEATURE_RANGE
+    scale = (hi - lo) / 255.0
+    zero_point = int(round(-128.0 - lo / scale))
+    return QuantParams(scale=scale, zero_point=max(-128, min(127, zero_point)))
+
+
 def write_ops_include(export_report: dict, out_path: Path) -> None:
     """Write the ``#include``-able op list consumed by kws_runner.cc."""
     ops = export_report.get("ops") or export_report.get("op_inventory") or {}
@@ -141,6 +176,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--fir-taps", type=int, default=15)
     ap.add_argument("--ops-out", type=Path, default=Path("edge/esp32/main/kws_ops.inc"),
                     help="generated operator list for the TFLite-Micro resolver")
+    ap.add_argument("--allow-default-quant", action="store_true",
+                    help="build the tables even without a calibrated export, using a nominal "
+                         "feature range. Enough to compile and parity-test the front-end; NOT "
+                         "enough to deploy, because the device would dequantise with the wrong scale.")
     args = ap.parse_args(argv)
 
     params = FrontendParams()
@@ -162,8 +201,19 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[tables] WARNING: {frontend_file} not found, using defaults (no quantisation!)")
 
     if params.quant is None:
-        print("[tables] ERROR: no quantisation parameters available - run ml.tools.export_tflite first", file=sys.stderr)
-        return 2
+        if not args.allow_default_quant:
+            print(
+                "[tables] ERROR: no quantisation parameters available - run ml.tools.export_tflite first, "
+                "or pass --allow-default-quant to build uncalibrated tables for a compile/parity check",
+                file=sys.stderr,
+            )
+            return 2
+        params.quant = default_quant_params()
+        print(
+            f"[tables] WARNING: building UNCALIBRATED tables (scale={params.quant.scale:.6f}, "
+            f"zero_point={params.quant.zero_point}) - compile/parity only, do NOT flash this",
+            file=sys.stderr,
+        )
 
     window = hann_periodic(params.frame_length)
     mel = mel_filterbank(params.sample_rate, params.fft_size, params.num_mel_bins, params.lower_hz, params.upper_hz)

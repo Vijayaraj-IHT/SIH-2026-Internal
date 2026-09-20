@@ -44,17 +44,24 @@ typedef struct {
 } kws_quant_t;
 
 typedef struct {
-    /* input side: raw 16-bit PCM ring of the last `hop` samples */
-    int16_t sample_ring[KWS_FRAME_HOP];
+    /* input side: the samples of the frame currently being assembled.  This has
+     * to hold a whole frame, not a hop: the code writes
+     * `sample_ring[KEEP + samples_since_frame]` with `samples_since_frame` up to
+     * HOP-1, so a HOP-sized ring is overflowed by KEEP samples on the very first
+     * frame - straight into `samples_since_frame` and the spectrogram behind it. */
+    int16_t sample_ring[KWS_FRAME_LENGTH];
     uint32_t samples_since_frame;
 
     /* rolling spectrogram: KWS_CONTEXT_FRAMES x KWS_NUM_MEL_BINS, int8 */
     int8_t frames[KWS_CONTEXT_FRAMES][KWS_NUM_MEL_BINS];
     uint32_t frames_filled;
 
-    /* scratch */
+    /* scratch.  These live in the instance rather than on the stack: the audio
+     * task has a fixed stack budget, and a 1 KB `power[]` local in the per-frame
+     * path is exactly the kind of thing that works until the frame size changes. */
     float fft_re[KWS_FFT_SIZE];
     float fft_im[KWS_FFT_SIZE];
+    float fft_power[KWS_FFT_SIZE / 2 + 1];
     uint32_t bit_reverse[KWS_FFT_SIZE];
 
     kws_quant_t quant;
@@ -71,8 +78,13 @@ void kws_frontend_init(kws_frontend_t *fe, kws_quant_t quant);
 /*
  * Compute the log-mel vector for one frame of KWS_FRAME_LENGTH samples.
  * `frame` must point at KWS_FRAME_LENGTH int16 samples.
+ *
+ * `fe` is NOT const: the windowed frame and its spectrum are computed in the
+ * instance's scratch buffers so the audio task does not carry that memory on its
+ * stack.  The call is otherwise free of side effects - it does not touch the
+ * rolling spectrogram or the sample ring.
  */
-void kws_frontend_frame(const kws_frontend_t *fe, const int16_t *frame, int8_t out[KWS_NUM_MEL_BINS]);
+void kws_frontend_frame(kws_frontend_t *fe, const int16_t *frame, int8_t out[KWS_NUM_MEL_BINS]);
 
 /*
  * Push `n` new samples into the streaming front-end.
@@ -98,8 +110,18 @@ void kws_frontend_reset(kws_frontend_t *fe);
 
 /*
  * Convenience one-shot helper used by the host simulator and unit tests:
- * waveform -> (KWS_CONTEXT_FRAMES * KWS_NUM_MEL_BINS) int8 features, using the
- * same left-padding rule as the streaming path.
+ * waveform -> (KWS_CONTEXT_FRAMES * KWS_NUM_MEL_BINS) int8 features.
+ *
+ * Contract: only the first KWS_WINDOW_SAMPLES samples are consumed, so the result
+ * is the FIRST CONTEXT_FRAMES frames of the clip, left-padded with the quantised
+ * log floor if the clip is shorter than that. This is what
+ * `ml.common.features.features_from_waveform` returns, and
+ * `tests/test_frontend_parity.py` holds the two implementations to it.
+ *
+ * Note the difference from the streaming path: after N frames have been pushed,
+ * `kws_frontend_window` returns the LAST CONTEXT_FRAMES frames, which is the
+ * correct window for scoring live audio. The two are only the same for a clip of
+ * exactly one window.
  */
 void kws_frontend_waveform_to_features(const int16_t *pcm, size_t n_samples, int8_t *out_features);
 
