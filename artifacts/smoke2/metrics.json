@@ -1,0 +1,20 @@
+{
+  "run_name": "smoke2",
+  "keyword": "hi_bixby",
+  "best_epoch": 2,
+  "val_auc": 0.7165536889674821,
+  "val_ap": 0.08958528935909271,
+  "threshold": 0.38153760297393796,
+  "target_fa_per_hour": 0.5,
+  "val_recall_at_threshold": 0.0,
+  "val_fa_per_hour": 0.0,
+  "val_positive_windows": 39,
+  "val_negative_windows": 1305,
+  "val_negative_hours": 0.35524999999999995,
+  "params_total": 165922,
+  "train_minutes": 1.3881940960884094,
+  "tensorflow": "2.20.0",
+  "python": "3.11.2",
+  "epochs": 2,
+  "batch_size": 64
+}

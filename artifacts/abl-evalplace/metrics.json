@@ -1,0 +1,20 @@
+{
+  "run_name": "abl-evalplace",
+  "keyword": "hi_bixby",
+  "best_epoch": 2,
+  "val_auc": 0.819550308327932,
+  "val_ap": 0.21743161976337433,
+  "threshold": 0.18699641687965393,
+  "target_fa_per_hour": 0.5,
+  "val_recall_at_threshold": 0.0,
+  "val_fa_per_hour": 0.0,
+  "val_positive_windows": 214,
+  "val_negative_windows": 5162,
+  "val_negative_hours": 1.4052111111111112,
+  "params_total": 65153,
+  "train_minutes": 5.328788395722707,
+  "tensorflow": "2.20.0",
+  "python": "3.11.2",
+  "epochs": 4,
+  "batch_size": 128
+}
