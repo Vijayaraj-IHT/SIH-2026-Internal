@@ -1,0 +1,95 @@
+name: CI
+
+# What can be checked without the audio corpora (which are hundreds of megabytes
+# and cannot be redistributed) is checked here: the audio codecs against the ITU
+# reference, the feature front-end against the C implementation that runs on the
+# device, the window placement geometry, the streaming policy and the served API.
+#
+# Tests that need the cache or a trained run skip themselves via the markers in
+# tests/conftest.py, so this workflow is green on a fresh clone and becomes
+# stricter as data is added.
+
+on:
+  push:
+    branches: [main, "arena/**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      # `cache: pip` needs an explicit dependency path here: the default looks for
+      # `requirements.txt` or `pyproject.toml`, and this repo has neither - it has
+      # split requirement files - so setup-python fails the job outright rather
+      # than caching nothing.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements-ml.txt
+            requirements-server.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # CPU-only TensorFlow keeps the image small; the project has no GPU path.
+          pip install -r requirements-ml.txt
+          pip install -r requirements-server.txt
+          pip install -r requirements-dev.txt
+
+      - name: Build the C front-end (host simulator)
+        run: |
+          # The window and mel filterbank tables are pure functions of the front-end
+          # parameters - they do not depend on training - so a fresh clone can build
+          # and parity-test the C code. Only the int8 quantisation constants come
+          # from an exported run, and --allow-default-quant substitutes a nominal
+          # range for them (the tool says loudly that such tables must not be
+          # flashed). --warn-error would be the ideal flag here; `make` already
+          # builds with -Wall -Wextra, and the generator emits brace-correct tables.
+          python -m edge.tools.export_frontend_header --allow-default-quant
+          make -C edge/host_sim
+
+      - name: Test suite
+        run: python -m pytest tests -q
+
+      - name: Front-end parity is not silently skipping
+        run: |
+          # tests/test_frontend_parity.py skips when the binary is missing, which is
+          # right on a bare checkout but must never happen in CI - a skipped parity
+          # test looks identical to a passing one in the summary.
+          python -m pytest tests/test_frontend_parity.py -q -rs | tee /tmp/parity.txt
+          if grep -q "skipped" /tmp/parity.txt; then
+            echo "::error::front-end parity tests were skipped - the C front-end was not exercised"
+            exit 1
+          fi
+
+      - name: Import smoke test (every module must at least import)
+        run: |
+          python - <<'PY'
+          import importlib
+          for mod in [
+              "ml.common.audio", "ml.common.features", "ml.common.streaming", "ml.common.synth",
+              "ml.data.pipeline", "ml.models.dscnn",
+              "ml.tools.train", "ml.tools.evaluate", "ml.tools.export_tflite", "ml.tools.streaming_eval",
+              "server.app", "server.asr", "server.runtime", "server.store",
+          ]:
+              importlib.import_module(mod)
+              print("ok", mod)
+          PY
+
+      - name: Server smoke test
+        run: |
+          python - <<'PY'
+          from fastapi.testclient import TestClient
+          from server.app import app
+          client = TestClient(app)
+          assert client.get("/v1/health").status_code == 200
+          assert client.get("/v1/model").status_code == 200
+          print("server health ok")
+          PY

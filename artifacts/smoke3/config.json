@@ -1,0 +1,47 @@
+{
+  "dscnn": {
+    "input_frames": 49,
+    "input_bins": 40,
+    "width": 1.0,
+    "stem_filters": 64,
+    "stem_kernel": [
+      10,
+      4
+    ],
+    "stem_stride": [
+      2,
+      2
+    ],
+    "block_filters": [
+      64,
+      64,
+      64,
+      128,
+      128,
+      128
+    ],
+    "stride_after": [
+      3,
+      5
+    ],
+    "dropout": 0.2,
+    "l2": 1e-05,
+    "head": "single"
+  },
+  "augment": {
+    "gain_db": 6.0,
+    "noise_prob": 0.7,
+    "noise_snr_db": [
+      0.0,
+      20.0
+    ],
+    "partial_negative_prob": 0.3,
+    "silence_prob": 0.03,
+    "background_prob": 0.05
+  },
+  "lr": 0.003,
+  "pos_weight": 5.0,
+  "frame_loss_weight": 0.3,
+  "seed": 1337,
+  "width": 1.0
+}

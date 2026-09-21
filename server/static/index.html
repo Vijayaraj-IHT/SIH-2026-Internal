@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SIH26172 · Voice Activator — Edge + Cloud Console</title>
+<link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <div class="logo">◉</div>
+    <div>
+      <h1>Low-Latency Voice Activator <span class="tag">SIH26172</span></h1>
+      <p class="sub">Keyword spotting on the edge · G.711 µ-law uplink · remote ASR</p>
+    </div>
+  </div>
+  <div class="health" id="health">
+    <span class="pill" id="pill-model">model …</span>
+    <span class="pill" id="pill-asr">asr …</span>
+    <span class="pill" id="pill-demo">demo …</span>
+  </div>
+</header>
+
+<nav class="tabs">
+  <button class="tab active" data-tab="stream">Stream demo</button>
+  <button class="tab" data-tab="mic">Speak into mic</button>
+  <button class="tab" data-tab="model">Model &amp; metrics</button>
+  <button class="tab" data-tab="fleet">Fleet telemetry</button>
+</nav>
+
+<main>
+  <!-- ================================================================== -->
+  <section class="panel active" id="tab-stream">
+    <div class="grid-2">
+      <div class="card">
+        <h2>1 · Continuous stream, detected on the device</h2>
+        <p class="muted">
+          A synthesised stream built from <strong>held-out</strong> corpus clips mixed with real background
+          recordings. The curve below is the actual output of the <code>model_int8.tflite</code> that the
+          firmware embeds — one score per 20&nbsp;ms hop. The marker shows where the detector crossed the
+          threshold for <span id="kw-name">the keyword</span>.
+        </p>
+        <div class="controls">
+          <label>seed <input type="number" id="seed" value="2026" min="1" step="1" /></label>
+          <label>seconds <input type="number" id="seconds" value="45" min="5" max="120" step="5" /></label>
+          <button id="btn-start" class="primary">▶ Run stream</button>
+          <button id="btn-stop" disabled>■ Stop</button>
+        </div>
+        <canvas id="canvas-stream" width="1100" height="300"></canvas>
+        <div class="legend">
+          <span><i class="sw sw-score"></i> window score</span>
+          <span><i class="sw sw-thr"></i> threshold τ</span>
+          <span><i class="sw sw-det"></i> detection (wake)</span>
+          <span><i class="sw sw-truth"></i> ground-truth keyword end</span>
+        </div>
+        <div class="readout" id="readout-stream">idle</div>
+      </div>
+
+      <div class="card">
+        <h2>2 · What the device sends after waking</h2>
+        <p class="muted">
+          Only the audio <em>after</em> a wake event leaves the device, encoded as 8 kHz G.711 µ-law
+          (64 kbit/s) instead of 16 kHz linear PCM (256 kbit/s).
+        </p>
+        <div class="stats" id="uplink-stats"></div>
+        <h3>Uplink transcript</h3>
+        <div class="transcript" id="transcript">—</div>
+        <div class="readout small" id="readout-asr">no utterance sent yet</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>3 · Detection log</h2>
+      <table class="table" id="detections-table">
+        <thead><tr><th>#</th><th>time</th><th>score</th><th>latency vs truth</th><th>truth</th><th>uplink</th><th>transcript</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ================================================================== -->
+  <section class="panel" id="tab-mic">
+    <div class="card">
+      <h2>Say the keyword into your microphone</h2>
+      <p class="muted">
+        The browser records raw PCM, the server runs the shipped int8 detector over it and returns the whole
+        decision timeline. Nothing is uploaded until you stop the recording; the transcript comes from the
+        same µ-law uplink path the device uses.
+      </p>
+      <div class="controls">
+        <button id="btn-rec" class="primary">● Record</button>
+        <button id="btn-rec-stop" disabled>■ Stop &amp; analyse</button>
+        <label class="muted">threshold τ <input type="number" id="mic-threshold" step="0.01" /></label>
+        <label class="muted">confirm windows <input type="number" id="mic-confirm" min="1" max="5" step="1" value="2" /></label>
+      </div>
+      <p class="muted" id="mic-status">idle</p>
+      <canvas id="canvas-mic" width="1100" height="280"></canvas>
+      <div class="readout" id="readout-mic">—</div>
+      <h3>Transcript of the detected segment</h3>
+      <div class="transcript" id="mic-transcript">—</div>
+    </div>
+  </section>
+
+  <!-- ================================================================== -->
+  <section class="panel" id="tab-model">
+    <div class="grid-2">
+      <div class="card">
+        <h2>Model card</h2>
+        <table class="table kv" id="model-table"></table>
+      </div>
+      <div class="card">
+        <h2>Efficiency budget (SIH26172 hard limits)</h2>
+        <div class="budget" id="budget"></div>
+        <h3>Latency / false-alarm trade-off</h3>
+        <p class="muted">
+          Measured on continuous streams of held-out audio: latency from the true end of the keyword to the
+          detection instant, false activations per hour split by the audio that caused them.
+        </p>
+        <table class="table" id="tradeoff-table"></table>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Detector internals</h2>
+      <div class="grid-2">
+        <div>
+          <h3>Pipeline</h3>
+          <ul class="muted small" id="pipeline-list"></ul>
+        </div>
+        <div>
+          <h3>Graph ops (must all be int8)</h3>
+          <ul class="muted small mono" id="ops-list"></ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================================================================== -->
+  <section class="panel" id="tab-fleet">
+    <div class="grid-2">
+      <div class="card">
+        <h2>Aggregate metrics</h2>
+        <div class="stats" id="fleet-stats"></div>
+        <button id="btn-reset" class="danger small">Clear telemetry</button>
+      </div>
+      <div class="card">
+        <h2>Wake latency distribution</h2>
+        <canvas id="canvas-latency" width="540" height="240"></canvas>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Recent wake events</h2>
+      <table class="table" id="wake-table">
+        <thead><tr><th>time</th><th>device</th><th>keyword</th><th>score</th><th>τ</th><th>latency</th><th>policy</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <h3>Recent ASR requests</h3>
+      <table class="table" id="asr-table">
+        <thead><tr><th>time</th><th>device</th><th>codec</th><th>bytes</th><th>audio</th><th>decode</th><th>RTF</th><th>text</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <span>Smart India Hackathon 2026 · ISRO · problem statement SIH26172</span>
+  <span id="footer-note" class="muted"></span>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

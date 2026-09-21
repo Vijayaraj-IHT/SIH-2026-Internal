@@ -1,0 +1,20 @@
+{
+  "run_name": "abl-noaug",
+  "keyword": "hi_bixby",
+  "best_epoch": 4,
+  "val_auc": 0.8172532380769607,
+  "val_ap": 0.16239725053310394,
+  "threshold": 0.1696777657995224,
+  "target_fa_per_hour": 0.5,
+  "val_recall_at_threshold": 0.0,
+  "val_fa_per_hour": 0.0,
+  "val_positive_windows": 214,
+  "val_negative_windows": 5162,
+  "val_negative_hours": 1.4052111111111112,
+  "params_total": 65153,
+  "train_minutes": 3.997409971555074,
+  "tensorflow": "2.20.0",
+  "python": "3.11.2",
+  "epochs": 4,
+  "batch_size": 128
+}
