@@ -1,9 +1,0 @@
-# ---------------------------------------------------------------------------
-# Model training / evaluation / export
-#   pip install -r requirements-ml.txt
-# ---------------------------------------------------------------------------
-tensorflow-cpu>=2.16,<2.21
-numpy>=1.26,<3
-scipy>=1.11          # polyphase resampling for mixed-rate corpora
-matplotlib>=3.8      # DET curves / training curves rendered into artifacts/
-tqdm>=4.66

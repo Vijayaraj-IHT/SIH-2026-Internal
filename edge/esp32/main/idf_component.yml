@@ -1,9 +1,0 @@
-## Dependencies for the voice activator firmware.
-##
-## esp-tflite-micro is the official Espressif port of TensorFlow Lite for
-## Microcontrollers.  Pinned to an exact version so a build six months from now
-## produces the same binary - and so the whole toolchain is open source, which is
-## a hard requirement of the problem statement.
-dependencies:
-  idf: ">=5.1"
-  espressif/esp-tflite-micro: "~1.3.1"
